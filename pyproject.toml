@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ml-model-serving-platform"
-version = "0.1.0"
+version = "1.0.0"
 description = "Production MLOps platform for serving ML models with A/B testing, drift detection, and monitoring"
 readme = "README.md"
 license = "MIT"

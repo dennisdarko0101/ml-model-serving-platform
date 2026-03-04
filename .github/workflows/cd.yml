@@ -1,0 +1,138 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+env:
+  GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+  GCP_REGION: us-central1
+  SERVICE_NAME: ml-serving
+  IMAGE_NAME: ml-serving
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_uri: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run (staging)
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }}-staging \
+            --image ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.GCP_PROJECT }} \
+            --memory 512Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 5 \
+            --port 8000 \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Get staging URL
+        id: url
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }}-staging \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.GCP_PROJECT }} \
+            --format 'value(status.url)')
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Smoke test staging
+        run: |
+          sleep 10
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ steps.url.outputs.url }}/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "Smoke test failed: HTTP $STATUS"
+            exit 1
+          fi
+          echo "Smoke test passed: HTTP $STATUS"
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run (production)
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.GCP_PROJECT }} \
+            --memory 1Gi \
+            --cpu 2 \
+            --min-instances 1 \
+            --max-instances 20 \
+            --port 8000 \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Verify production
+        run: |
+          sleep 10
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.GCP_PROJECT }} \
+            --format 'value(status.url)')
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" $URL/health)
+          echo "Production health: HTTP $STATUS"

@@ -1,107 +1,172 @@
 # Architecture — ML Model Serving Platform
 
-## System Overview
+## System Design
 
 ```
-                                    ┌─────────────────────────────────────────────────────────┐
-                                    │                     FastAPI Server                       │
-                                    │                                                         │
-  Client ──▶ POST /api/v1/predict ──▶  Middleware (logging, correlation ID)                   │
-                                    │      │                                                  │
-                                    │      ▼                                                  │
-                                    │  Routing Layer                                          │
-                                    │  ┌──────────┐  ┌────────┐  ┌────────┐                  │
-                                    │  │ A/B Test  │  │ Canary │  │ Shadow │                  │
-                                    │  └────┬─────┘  └───┬────┘  └───┬────┘                  │
-                                    │       └────────────┼───────────┘                        │
-                                    │                    ▼                                     │
-                                    │  Model Server (LRU cache, thread-safe)                  │
-                                    │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-                                    │  │ sklearn  │  │ PyTorch  │  │   ONNX   │              │
-                                    │  │ Predictor│  │ Predictor│  │ Predictor│              │
-                                    │  └──────────┘  └──────────┘  └──────────┘              │
-                                    │       │              │              │                    │
-                                    │       └──────────────┼──────────────┘                   │
-                                    │                      ▼                                  │
-                                    │  Monitoring Layer                                       │
-                                    │  ┌──────────┐  ┌───────────┐  ┌──────────┐             │
-                                    │  │ Metrics  │  │   Drift   │  │ Alerting │             │
-                                    │  │Collector │  │ Detector  │  │ Manager  │             │
-                                    │  └────┬─────┘  └───────────┘  └──────────┘             │
-                                    │       │                                                 │
-                                    └───────┼─────────────────────────────────────────────────┘
-                                            ▼
-                                    Prometheus ──▶ Grafana
+  Client Request
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  FastAPI Server                                              │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Middleware Layer                                       │  │
+│  │  • Correlation ID injection (X-Correlation-ID)         │  │
+│  │  • Request/response logging with structlog             │  │
+│  │  • Latency measurement                                 │  │
+│  └───────────────────────┬────────────────────────────────┘  │
+│                          ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Routing Layer                                         │  │
+│  │  ┌──────────┐  ┌──────────────┐  ┌────────────────┐   │  │
+│  │  │ A/B Test │  │    Canary     │  │  Shadow Mode   │   │  │
+│  │  │ (hash)   │  │ (percentage) │  │ (fire-forget)  │   │  │
+│  │  └────┬─────┘  └──────┬───────┘  └───────┬────────┘   │  │
+│  │       └───────────────┼───────────────────┘            │  │
+│  └───────────────────────┼────────────────────────────────┘  │
+│                          ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Serving Layer                                         │  │
+│  │                                                        │  │
+│  │  ModelServer (OrderedDict LRU, threading.Lock)         │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐             │  │
+│  │  │ sklearn  │  │ PyTorch  │  │   ONNX   │             │  │
+│  │  │Predictor │  │Predictor │  │Predictor │             │  │
+│  │  └──────────┘  └──────────┘  └──────────┘             │  │
+│  │                                                        │  │
+│  │  PreprocessingPipeline ─── DynamicBatcher (asyncio)    │  │
+│  └───────────────────────┬────────────────────────────────┘  │
+│                          ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Monitoring Layer                                      │  │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  │  │
+│  │  │ Metrics     │  │    Drift     │  │    Alert     │  │  │
+│  │  │ Collector   │  │  Detector    │  │   Manager    │  │  │
+│  │  │ (prometheus)│  │ (PSI/KS/χ²) │  │ (rules)      │  │  │
+│  │  └──────┬──────┘  └──────────────┘  └──────────────┘  │  │
+│  └─────────┼──────────────────────────────────────────────┘  │
+└────────────┼─────────────────────────────────────────────────┘
+             ▼
+     Prometheus ──▶ Grafana Dashboard
+
+     ┌────────────────────────────────────────────────┐
+     │  Deployment Layer                              │
+     │  CloudRunDeployer ─── RollbackManager          │
+     │  DockerDeployer ─── deploy.py CLI              │
+     └────────────────────────────────────────────────┘
 ```
 
-## Module Architecture
+## Component Details
 
 ### Registry Layer (`ml_serving/registry/`)
 
-- **ModelStore** — Persists model artifacts to disk (joblib, state_dict, .onnx)
-- **ModelRegistry** — JSON-file metadata store with version management, stage promotion
-- **Schemas** — Pydantic models: `Framework`, `ModelStage`, `ModelStatus`, `ModelMetadata`, `PredictionResult`
+| Component | Responsibility |
+|-----------|---------------|
+| `ModelStore` | Persist model artifacts to disk (joblib, state_dict, .onnx) |
+| `ModelRegistry` | JSON-file metadata: versions, stages, metrics, promotion |
+| `schemas.py` | Pydantic models: Framework, ModelStage, ModelStatus, ModelMetadata, PredictionResult |
 
 ### Serving Layer (`ml_serving/serving/`)
 
-- **BasePredictor** (ABC) — Framework-agnostic prediction interface
-  - `SklearnPredictor` — numpy-based sklearn inference
-  - `PyTorchPredictor` — tensor-based with device management
-  - `ONNXPredictor` — onnxruntime session
-- **PredictorFactory** — Maps `Framework` enum → concrete predictor class
-- **PreprocessingPipeline** — Composable chain of named transform functions
-- **ModelServer** — Thread-safe multi-model server with LRU eviction (OrderedDict)
-- **DynamicBatcher** — asyncio queue-based request batching with size/timeout flush
+| Component | Responsibility |
+|-----------|---------------|
+| `BasePredictor` | Abstract interface for all predictors |
+| `SklearnPredictor` | numpy-based sklearn inference |
+| `PyTorchPredictor` | Tensor-based with device management |
+| `ONNXPredictor` | onnxruntime session inference |
+| `PredictorFactory` | Maps Framework enum → concrete predictor |
+| `PreprocessingPipeline` | Composable chain of named transform functions |
+| `ModelServer` | Thread-safe multi-model server with OrderedDict LRU |
+| `DynamicBatcher` | asyncio queue-based request batching |
 
 ### Routing Layer (`ml_serving/routing/`)
 
-- **ABTest / ABTestManager** — Consistent-hash routing, result recording, chi-squared significance testing
-- **CanaryDeployment** — Percentage-based routing with fixed promotion steps (5→25→50→100%), auto-rollback on error threshold
-- **ShadowMode** — Fire-and-forget background thread for shadow predictions, agreement tracking
+| Component | Responsibility |
+|-----------|---------------|
+| `ABTest` | SHA-256 consistent hash routing for sticky sessions |
+| `ABTestManager` | Create/manage tests, record results, chi-squared significance |
+| `CanaryDeployment` | Percentage routing, fixed promotion steps, auto-rollback |
+| `ShadowMode` | Background thread shadow predictions, agreement tracking |
 
 ### Monitoring Layer (`ml_serving/monitoring/`)
 
-- **MetricsCollector** — Prometheus counters, histograms, gauges for predictions, latency, drift, models
-- **DriftDetector** — PSI, KS test, chi-squared with configurable thresholds and sliding windows
-- **AlertManager** — Rule-based alerting with conditions, severity levels, cooldown, log/webhook actions
+| Component | Responsibility |
+|-----------|---------------|
+| `MetricsCollector` | Prometheus counters, histograms, gauges |
+| `DriftDetector` | PSI, KS test, chi-squared with sliding windows |
+| `AlertManager` | Rule evaluation, cooldown, log/webhook actions |
 
 ### API Layer (`ml_serving/api/`)
 
-- **main.py** — FastAPI app with lifespan, CORS, shared `AppState` dataclass
-- **middleware.py** — Correlation ID injection, request/response logging
-- **schemas.py** — Pydantic request/response models for all endpoints
-- **routes/** — Modular routers: predict, models, experiments, monitoring, health
+| Component | Responsibility |
+|-----------|---------------|
+| `main.py` | FastAPI app, lifespan, CORS, shared AppState |
+| `middleware.py` | Correlation ID, request/response logging |
+| `schemas.py` | Pydantic request/response models |
+| `routes/predict.py` | Prediction endpoints with routing integration |
+| `routes/models.py` | Model CRUD: register, list, promote, load/unload |
+| `routes/experiments.py` | A/B test and canary lifecycle |
+| `routes/monitoring.py` | Metrics, drift, alerts, Prometheus endpoint |
+| `routes/health.py` | Per-model health check |
 
-### Infrastructure (`docker/`, `grafana/`)
+### Deployment Layer (`ml_serving/deployment/`)
 
-- **Dockerfile** — Multi-stage build, non-root user, healthcheck
-- **docker-compose.yml** — API + Prometheus + Grafana (3 services)
-- **Grafana dashboard** — Latency percentiles, throughput, error rate, active models, drift scores
+| Component | Responsibility |
+|-----------|---------------|
+| `CloudRunDeployer` | Build images, deploy/update/delete Cloud Run services |
+| `RollbackManager` | Checkpoint creation, manual/auto rollback |
+| `DockerDeployer` | Local Docker build, run, stop, health check |
 
-## Data Flow: Prediction Request
+## Request Flow: Prediction
 
-1. Client sends `POST /api/v1/predict` with `model_name`, `input_data`, optional `request_id`
-2. Middleware assigns correlation ID, logs request start
-3. Route handler checks for active A/B test or canary → determines target model
-4. `ModelServer.predict()` acquires lock, finds loaded model, runs preprocessing pipeline
-5. Framework-specific predictor runs inference, returns `PredictionResult`
-6. `MetricsCollector.record_prediction()` updates Prometheus counters/histograms
-7. Response returned with prediction, probabilities, latency, model info
+```
+1. POST /api/v1/predict
+       │
+2. Middleware assigns correlation ID, logs start
+       │
+3. Check active A/B tests → consistent hash on request_id → pick model
+   Check canary deployment → random % → pick model
+       │
+4. ModelServer.predict()
+   ├── Acquire lock, find model in OrderedDict
+   ├── Run PreprocessingPipeline (if registered)
+   ├── Framework-specific predictor.predict()
+   └── Refresh LRU position
+       │
+5. MetricsCollector.record_prediction()
+   ├── Increment prediction_count counter
+   └── Observe latency histogram
+       │
+6. Return PredictResponse with prediction, probabilities, latency, model info
+```
 
-## Key Design Patterns
+## Design Decisions
 
-| Pattern | Where | Why |
-|---------|-------|-----|
-| Factory | `PredictorFactory` | Framework-agnostic model instantiation |
-| Strategy | `BasePredictor` subclasses | Framework-specific inference logic |
-| Observer | `MetricsCollector` | Decoupled metrics recording |
-| Decorator | `PreprocessingPipeline` | Composable data transforms |
-| LRU Cache | `ModelServer._models` | Memory-bounded multi-model serving |
-| Singleton | `AppState` | Shared state across route handlers |
+| Decision | Rationale | Tradeoff |
+|----------|-----------|----------|
+| JSON file registry | Zero dependencies, human-readable, debuggable | Not suitable for concurrent writes at scale |
+| OrderedDict LRU | Simple, built-in, O(1) access refresh | Limited to single-process; use Redis for distributed |
+| No scipy dependency | PSI/KS/chi-squared via numpy + math.erfc | Slightly less precise p-values for edge cases |
+| Consistent hash routing | Deterministic sticky sessions, no state needed | Hash collisions can create slight traffic imbalance |
+| Fixed canary steps | Prevents accidental full rollout | Less flexible than arbitrary percentages |
+| Protocol-based mocking | CloudRunClient/DockerClient protocols | Requires test doubles instead of patching |
+| Fire-and-forget shadow | Zero latency impact on primary | Shadow failures are silently logged |
+| AppState dataclass | Single source of truth for all components | Global mutable state (mitigated by test override) |
+| Background thread for shadow | Simple, no async required | Thread overhead per shadow prediction |
+| Prometheus registry injection | Tests use isolated registries, no metric collisions | Slightly more setup in test fixtures |
 
 ## Testing Strategy
 
-- **Unit tests** — Individual modules with mocked dependencies (custom Prometheus registries, in-memory stores)
-- **Integration tests** — FastAPI TestClient with real sklearn models, full A/B lifecycle, end-to-end pipeline
-- **Test fixtures** — Shared `tmp_dir`, `settings`, `iris_clf` fixtures across test files
-- **181 total tests** — 82 from Phase 1 + 99 new from Phases 2-3
+| Layer | Tests | Approach |
+|-------|-------|----------|
+| Registry | 30 | Real sklearn models, temp directories |
+| Serving | 40 | Real Iris classifier, mocked PyTorch/ONNX |
+| Batching | 12 | Async tests with real predictions |
+| Routing | 31 | Statistical verification of traffic splits |
+| Monitoring | 35 | Isolated Prometheus registries, numpy-generated distributions |
+| Deployment | 19 | Protocol mocks for Cloud Run and Docker |
+| Rollback | 13 | Mocked HTTP for health checks |
+| API | 18 | FastAPI TestClient with real models |
+| A/B Integration | 10 | Full lifecycle: route → predict → record → conclude |
+| Pipeline | 5 | End-to-end: predict → route → metrics → drift |
+| **Total** | **213** | |

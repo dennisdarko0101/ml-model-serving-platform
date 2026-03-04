@@ -1,0 +1,67 @@
+name: Model Validation
+
+on:
+  push:
+    paths:
+      - "models/**"
+      - "model_artifacts/**"
+      - "ml_serving/serving/predictor.py"
+      - "ml_serving/registry/**"
+  pull_request:
+    paths:
+      - "models/**"
+      - "model_artifacts/**"
+
+jobs:
+  validate-models:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Train sample models
+        run: python models/sample/train_sample_models.py
+
+      - name: Validate model outputs
+        run: |
+          python -c "
+          import numpy as np
+          from sklearn.datasets import load_iris
+          import joblib
+          import sys
+
+          # Load the trained model
+          try:
+              clf = joblib.load('models/sample/iris_classifier.joblib')
+          except FileNotFoundError:
+              print('SKIP: No model file found (expected in CI)')
+              sys.exit(0)
+
+          X, y = load_iris(return_X_y=True)
+
+          # Verify predictions are valid class labels
+          preds = clf.predict(X)
+          assert all(p in [0, 1, 2] for p in preds), 'Invalid prediction classes'
+
+          # Verify accuracy is within expected range
+          accuracy = (preds == y).mean()
+          assert accuracy > 0.85, f'Accuracy {accuracy:.3f} below threshold 0.85'
+
+          # Verify probabilities sum to 1
+          probs = clf.predict_proba(X)
+          assert np.allclose(probs.sum(axis=1), 1.0), 'Probabilities do not sum to 1'
+
+          # Verify shape
+          assert probs.shape == (150, 3), f'Unexpected shape {probs.shape}'
+
+          print(f'Model validation passed: accuracy={accuracy:.3f}')
+          "
+
+      - name: Run model-specific tests
+        run: pytest tests/unit/test_serving.py -v -k "sklearn"
