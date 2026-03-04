@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Type checking
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+
+# Model artifacts (large binaries)
+model_artifacts/
+model_registry/
+models/sample/*.joblib
+models/sample/*.pt
+models/sample/*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
