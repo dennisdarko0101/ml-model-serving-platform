@@ -20,17 +20,45 @@
 
 - **`ml_serving/serving/batching.py`** — `DynamicBatcher` class: asyncio-based request collection with configurable `max_batch_size` and `timeout_ms`. Flushes on size or timeout, returns individual `PredictionResult` futures to each caller
 
-### Tests
+## What was built (Phase 2-3, Steps 4-8)
 
-- **`tests/unit/test_registry.py`** — 20 tests covering ModelStore (save/load/delete/list/detect) and ModelRegistry (register/get/promote/compare/lifecycle)
-- **`tests/unit/test_serving.py`** — 24 tests covering all three predictor types, preprocessing pipeline and built-in steps, model server with LRU eviction
-- **`tests/unit/test_batching.py`** — 12 async tests covering single/batch/concurrent requests, size and timeout flush triggers, start/stop lifecycle
+### Step 4: A/B Testing + Canary Deployments
 
-### Supporting Files
+- **`ml_serving/routing/ab_testing.py`** — `ABTest` with consistent hashing for sticky sessions, `ABTestManager` for creating/managing tests, recording results, computing statistical significance (chi-squared), and concluding tests with winner declaration
+- **`ml_serving/routing/canary.py`** — `CanaryDeployment` with configurable promotion steps (5% → 25% → 50% → 100%), automatic rollback on error threshold, per-model `CanaryMetrics` (error rate, latency percentiles)
+- **`ml_serving/routing/shadow.py`** — `ShadowMode` runs a shadow model in a background thread (fire-and-forget), compares predictions via `ShadowReport` (agreement rate, divergences, latencies)
 
-- **`models/sample/train_sample_models.py`** — Creates iris classifier + regression model
-- **`.env.example`**, **`Makefile`**, **`.gitignore`**, **`LICENSE`**, **`CONTRIBUTING.md`**
-- **`.github/workflows/ci.yml`** — Lint + test matrix (3.11, 3.12)
+### Steps 5-6: Monitoring & Drift Detection
+
+- **`ml_serving/monitoring/metrics.py`** — `MetricsCollector` wrapping prometheus_client: prediction count/latency/status counters, model load time, active models gauge, batch size histogram, drift score gauge, request queue size. Supports custom registries for testing
+- **`ml_serving/monitoring/drift_detector.py`** — `DriftDetector` with PSI (Population Stability Index), KS test (Kolmogorov-Smirnov), and chi-squared for categorical features. Configurable thresholds, sliding window for current data, reference distribution storage per model
+- **`ml_serving/monitoring/alerting.py`** — `AlertManager` with configurable rules (gt/lt/gte/lte/eq conditions), severity levels (info/warning/critical), cooldown periods, log and webhook actions, metric provider registration
+
+### Step 7: FastAPI Server
+
+- **`ml_serving/api/schemas.py`** — Pydantic request/response models for all endpoints
+- **`ml_serving/api/middleware.py`** — Request logging middleware with correlation ID injection
+- **`ml_serving/api/main.py`** — FastAPI app with lifespan management, CORS, shared `AppState` dataclass, test-friendly `set_app_state()` override
+- **`ml_serving/api/routes/predict.py`** — Single and batch prediction with A/B test and canary routing integration
+- **`ml_serving/api/routes/models.py`** — Model CRUD: register, list, get, promote, archive, load, unload
+- **`ml_serving/api/routes/experiments.py`** — A/B test and canary lifecycle endpoints
+- **`ml_serving/api/routes/monitoring.py`** — Metrics summary, drift reports, alerts, Prometheus scrape endpoint
+- **`ml_serving/api/routes/health.py`** — Detailed health check with per-model status
+
+### Step 8: Docker + Grafana
+
+- **`docker/Dockerfile`** — Multi-stage build, non-root user, healthcheck
+- **`docker/docker-compose.yml`** — API + Prometheus + Grafana (3 services) with volumes
+- **`docker/prometheus.yml`** — Prometheus scrape config targeting the API service
+- **`grafana/dashboards/model_serving.json`** — Pre-built dashboard: prediction latency (p50/p95/p99), request throughput, error rate, active models, drift scores
+
+### Tests (99 new, 181 total)
+
+- **`tests/unit/test_routing.py`** — 31 tests: A/B routing, consistent hashing, canary promotion/rollback/auto-promote, shadow mode
+- **`tests/unit/test_monitoring.py`** — 35 tests: metrics recording, drift detection (PSI, KS, chi-squared), alerting rules/cooldown/webhooks
+- **`tests/integration/test_api.py`** — 18 tests: all API endpoints (health, models, predict, experiments, monitoring)
+- **`tests/integration/test_ab_testing.py`** — 10 tests: full A/B test lifecycle, sticky sessions, traffic distribution, statistical significance
+- **`tests/integration/test_pipeline.py`** — 5 tests: predict → route → monitor end-to-end flow
 
 ## Key Design Decisions
 
@@ -39,10 +67,17 @@
 3. **Framework abstraction** — `BasePredictor` + `PredictorFactory` lets the server be framework-agnostic. Adding a new framework requires one new predictor class.
 4. **Async batching** — `DynamicBatcher` uses `asyncio.Queue` and `Future`s so callers don't need to know about batching. Transparent throughput improvement for GPU models.
 5. **Composable preprocessing** — Each model can have its own pipeline. Steps are plain functions, easy to test independently.
+6. **Consistent hashing for A/B tests** — SHA-256 based routing ensures the same request_id always hits the same model (sticky sessions) without server-side session state.
+7. **No scipy dependency** — PSI, KS, and chi-squared tests use numpy + math.erfc approximations. Keeps the dependency tree lean.
+8. **Test-friendly AppState** — `set_app_state()` lets tests inject custom state without hitting the lifespan. Custom Prometheus registries prevent metric name collisions across tests.
+9. **Shadow mode fire-and-forget** — Background thread for shadow predictions ensures zero impact on primary response time.
+10. **Canary promotion steps** — Fixed steps (5% → 25% → 50% → 100%) prevent accidental full rollout. Auto-promote checks error rate before advancing.
 
-## What's Next (Phase 2)
+## What's Next (Phase 4+)
 
-- **A/B Testing / Traffic Routing** — Route requests across model versions by weight, sticky sessions, gradual rollout
-- **Drift Detection** — Statistical tests (PSI, KS, chi-squared) on input features and prediction distributions
-- **Prometheus Monitoring** — Latency histograms, prediction counters, model health gauges
-- **FastAPI Endpoints** — REST API for predictions, model management, health checks
+- **Database-backed registry** — Replace JSON files with SQLite or Postgres for concurrent access
+- **Cloud storage** — S3/GCS backends for model artifacts (boto3 and google-cloud-storage already in deps)
+- **Authentication** — API key or OAuth2 for the REST API
+- **Model warm-up benchmarks** — Track inference latency during warmup and expose as metrics
+- **Kubernetes deployment** — Helm charts, HPA based on queue size, model-specific resource limits
+- **Streaming predictions** — WebSocket endpoint for real-time inference
