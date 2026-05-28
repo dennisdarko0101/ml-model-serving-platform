@@ -7,7 +7,7 @@ WORKDIR /build
 COPY pyproject.toml .
 COPY ml_serving/ ml_serving/
 
-RUN pip install --no-cache-dir --prefix=/install .
+RUN pip install --no-cache-dir --timeout=300 --retries=10 --prefix=/install .
 
 # Stage 2: Runtime
 FROM python:3.11-slim AS runtime
